@@ -30,10 +30,11 @@ const pool = new Pool({ connectionString: databaseUrl, max: 10 });
 const allowedEventTypes = new Set(['page_view', 'add_to_cart', 'begin_checkout', 'purchase']);
 
 function isTrustedBrowserOrigin(origin) {
+  if (origin === 'null') return true;
   if (origin === trustedOrigin) return true;
   try {
     const url = new URL(origin);
-    return url.protocol === 'https:' && (url.hostname.endsWith('.myshopify.com') || url.hostname.endsWith('.shopifycdn.com'));
+    return url.protocol === 'https:' && (url.hostname.endsWith('.myshopify.com') || url.hostname.endsWith('.shopifycdn.com') || url.hostname.endsWith('.shopify.com'));
   } catch {
     return false;
   }
