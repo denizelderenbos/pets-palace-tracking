@@ -284,7 +284,10 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && url.pathname === '/v1/events') {
-    if (!isTrustedBrowserOrigin(origin)) return sendJson(response, 403, { error: 'untrusted_origin' }, origin);
+    if (!isTrustedBrowserOrigin(origin)) {
+      console.warn('Rejected browser event from origin', origin ?? 'missing');
+      return sendJson(response, 403, { error: 'untrusted_origin' }, origin);
+    }
     try {
       const event = await readJson(request);
       const eventType = event.event_type;
