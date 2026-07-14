@@ -11,6 +11,43 @@ if (!databaseUrl) throw new Error('DATABASE_URL is required');
 const pool = new Pool({ connectionString: databaseUrl, max: 10 });
 const allowedEventTypes = new Set(['page_view', 'add_to_cart', 'begin_checkout', 'purchase']);
 
+async function bootstrapSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tracking_events (
+      id BIGSERIAL PRIMARY KEY,
+      event_id UUID NOT NULL UNIQUE,
+      event_type TEXT NOT NULL CHECK (event_type IN ('page_view', 'add_to_cart', 'begin_checkout', 'purchase')),
+      source TEXT NOT NULL CHECK (source IN ('browser', 'shopify_webhook', 'shopify_pixel')),
+      occurred_at TIMESTAMPTZ NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      order_id TEXT,
+      attribution_id UUID,
+      analytics_consent BOOLEAN NOT NULL DEFAULT false,
+      marketing_consent BOOLEAN NOT NULL DEFAULT false,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+    CREATE INDEX IF NOT EXISTS tracking_events_type_occurred_at_idx
+      ON tracking_events (event_type, occurred_at DESC);
+    CREATE INDEX IF NOT EXISTS tracking_events_order_id_idx
+      ON tracking_events (order_id) WHERE order_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS webhook_receipts (
+      webhook_id UUID PRIMARY KEY,
+      topic TEXT NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS delivery_attempts (
+      id BIGSERIAL PRIMARY KEY,
+      event_id UUID NOT NULL REFERENCES tracking_events(event_id) ON DELETE CASCADE,
+      destination TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      sent_at TIMESTAMPTZ,
+      error_code TEXT,
+      UNIQUE (event_id, destination)
+    );
+  `);
+}
+
 function sendJson(response, status, body, origin) {
   const headers = {
     'Content-Type': 'application/json; charset=utf-8',
@@ -123,9 +160,16 @@ const server = http.createServer(async (request, response) => {
   return sendJson(response, 404, { error: 'not_found', request_id: randomUUID() }, origin);
 });
 
-server.listen(port, '0.0.0.0', () => {
-  console.log(`pets-palace-tracking listening on ${port}`);
-});
+bootstrapSchema()
+  .then(() => {
+    server.listen(port, '0.0.0.0', () => {
+      console.log(`pets-palace-tracking listening on ${port}`);
+    });
+  })
+  .catch((error) => {
+    console.error('Unable to initialise the tracking database', error);
+    process.exit(1);
+  });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
