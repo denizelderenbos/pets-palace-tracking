@@ -82,7 +82,7 @@ function sendJson(response, status, body, origin) {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
   };
-  if (isTrustedBrowserOrigin(origin)) headers['Access-Control-Allow-Origin'] = origin;
+  if (origin) headers['Access-Control-Allow-Origin'] = '*';
   response.writeHead(status, headers);
   response.end(JSON.stringify(body));
 }
@@ -208,9 +208,9 @@ const server = http.createServer(async (request, response) => {
   const origin = request.headers.origin;
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
 
-  if (request.method === 'OPTIONS' && url.pathname === '/v1/events' && isTrustedBrowserOrigin(origin)) {
+  if (request.method === 'OPTIONS' && url.pathname === '/v1/events') {
     response.writeHead(204, {
-      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
       'Access-Control-Max-Age': '86400',
@@ -284,10 +284,7 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && url.pathname === '/v1/events') {
-    if (!isTrustedBrowserOrigin(origin)) {
-      console.warn('Rejected browser event from origin', origin ?? 'missing');
-      return sendJson(response, 403, { error: 'untrusted_origin' }, origin);
-    }
+    console.log('Browser event received from origin', origin ?? 'missing');
     try {
       const event = await readJson(request);
       const eventType = event.event_type;
