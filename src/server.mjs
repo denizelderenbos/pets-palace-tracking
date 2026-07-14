@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createHash, createHmac, createPrivateKey, createPublicKey, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, createPrivateKey, createPublicKey, createSign, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Pool } from 'pg';
 
 const port = Number(process.env.PORT ?? 3000);
@@ -18,6 +18,11 @@ const workloadIdentityPublicJwk = workloadIdentityPrivateKey
       use: 'sig',
     }
   : null;
+const googleWifAudience = process.env.GOOGLE_WIF_AUDIENCE;
+const googleServiceAccount = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+const googleAdsCustomerId = process.env.GOOGLE_ADS_CUSTOMER_ID;
+const googleAdsConversionActionId = process.env.GOOGLE_ADS_CONVERSION_ACTION_ID;
+const googleDataManagerEnabled = process.env.GOOGLE_DATA_MANAGER_ENABLED === 'true';
 
 if (!databaseUrl) throw new Error('DATABASE_URL is required');
 
@@ -161,6 +166,33 @@ async function healthcheck() {
   await pool.query('SELECT 1');
 }
 
+function b64url(value) { return Buffer.from(value).toString('base64url'); }
+
+async function googleAccessToken() {
+  if (!workloadIdentityPrivateKey || !googleWifAudience || !googleServiceAccount) throw new Error('google_auth_not_configured');
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: workloadIdentityKeyId }));
+  const claims = b64url(JSON.stringify({ iss: workloadIdentityIssuer, sub: 'tracking-service', aud: workloadIdentityIssuer, iat: now, exp: now + 600 }));
+  const signer = createSign('RSA-SHA256'); signer.update(`${header}.${claims}`);
+  const assertion = `${header}.${claims}.${signer.sign(createPrivateKey(workloadIdentityPrivateKey.replace(/\\n/g, '\n'))).toString('base64url')}`;
+  const sts = await fetch('https://sts.googleapis.com/v1/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange', requested_token_type: 'urn:ietf:params:oauth:token-type:access_token', subject_token_type: 'urn:ietf:params:oauth:token-type:jwt', audience: googleWifAudience, scope: 'https://www.googleapis.com/auth/cloud-platform', subject_token: assertion }) });
+  const federated = await sts.json(); if (!sts.ok) throw new Error(`sts_${sts.status}`);
+  const iam = await fetch(`https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(googleServiceAccount)}:generateAccessToken`, { method: 'POST', headers: { Authorization: `Bearer ${federated.access_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ scope: ['https://www.googleapis.com/auth/datamanager'], lifetime: '900s' }) });
+  const token = await iam.json(); if (!iam.ok) throw new Error(`iam_${iam.status}`); return token.accessToken;
+}
+
+async function deliverPendingPurchases() {
+  if (!googleDataManagerEnabled || !googleAdsCustomerId || !googleAdsConversionActionId) return;
+  const rows = await pool.query(`SELECT d.id, e.event_id, e.occurred_at, e.order_id, e.payload FROM delivery_attempts d JOIN tracking_events e ON e.event_id=d.event_id WHERE d.destination='google_data_manager' AND d.status='pending' ORDER BY d.id LIMIT 50`);
+  if (!rows.rowCount) return;
+  try {
+    const events = rows.rows.map(({ event_id, occurred_at, order_id, payload }) => ({ transactionId: order_id, eventTimestamp: occurred_at.toISOString(), currency: payload.currency, conversionValue: Number(payload.value), eventSource: 'WEB', adIdentifiers: payload.click_ids, destinationReferences: ['purchase'], additionalEventParameters: [{ parameterName: 'event_id', value: event_id }] }));
+    const response = await fetch('https://datamanager.googleapis.com/v1/events:ingest', { method: 'POST', headers: { Authorization: `Bearer ${await googleAccessToken()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ destinations: [{ destinationReference: 'purchase', operatingAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, loginAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, productDestinationId: googleAdsConversionActionId }], events }) });
+    if (!response.ok) throw new Error(`datamanager_${response.status}`);
+    await pool.query(`UPDATE delivery_attempts SET status='sent', sent_at=now() WHERE id = ANY($1)`, [rows.rows.map((r) => r.id)]);
+  } catch (error) { console.error('Google Data Manager delivery failed', error); }
+}
+
 const server = http.createServer(async (request, response) => {
   const origin = request.headers.origin;
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
@@ -232,6 +264,7 @@ const server = http.createServer(async (request, response) => {
           cleanPaidOrder(order),
         ],
       );
+      await pool.query(`INSERT INTO delivery_attempts (event_id, destination, status) VALUES ($1, 'google_data_manager', 'pending') ON CONFLICT DO NOTHING`, [stableUuid(`shopify-order:${order.id}`)]);
       return sendJson(response, 202, { accepted: true }, origin);
     } catch (error) {
       const knownError = error instanceof Error && ['payload_too_large'].includes(error.message);
@@ -283,6 +316,7 @@ bootstrapSchema()
   .then(() => {
     server.listen(port, '0.0.0.0', () => {
       console.log(`pets-palace-tracking listening on ${port}`);
+      setInterval(() => deliverPendingPurchases().catch((error) => console.error(error)), 30_000).unref();
     });
   })
   .catch((error) => {
