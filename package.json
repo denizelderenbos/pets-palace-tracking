@@ -1,0 +1,17 @@
+{
+  "name": "pets-palace-tracking",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted server-side conversion tracking for Pet's Palace",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}
