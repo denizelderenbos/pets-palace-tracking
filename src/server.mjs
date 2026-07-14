@@ -1,10 +1,12 @@
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Pool } from 'pg';
 
 const port = Number(process.env.PORT ?? 3000);
 const trustedOrigin = process.env.TRUSTED_ORIGIN ?? 'https://pets-palace.nl';
 const databaseUrl = process.env.DATABASE_URL;
+const shopifyWebhookSecret = process.env.SHOPIFY_WEBHOOK_SECRET;
+const shopifyShopDomain = process.env.SHOPIFY_SHOP_DOMAIN ?? 'pets-palace-eu.myshopify.com';
 
 if (!databaseUrl) throw new Error('DATABASE_URL is required');
 
@@ -58,16 +60,21 @@ function sendJson(response, status, body, origin) {
   response.end(JSON.stringify(body));
 }
 
-async function readJson(request) {
+async function readBody(request, maximumBytes = 32_768) {
   const chunks = [];
   let length = 0;
   for await (const chunk of request) {
     length += chunk.length;
-    if (length > 32_768) throw new Error('payload_too_large');
+    if (length > maximumBytes) throw new Error('payload_too_large');
     chunks.push(chunk);
   }
+  return Buffer.concat(chunks);
+}
+
+async function readJson(request) {
+  const body = await readBody(request);
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return JSON.parse(body.toString('utf8'));
   } catch {
     throw new Error('invalid_json');
   }
@@ -91,6 +98,52 @@ function cleanPayload(eventType, value) {
   return Object.fromEntries(fields.flatMap((field) => (
     Object.hasOwn(value, field) ? [[field, value[field]]] : []
   )));
+}
+
+function stableUuid(value) {
+  const bytes = createHash('sha256').update(value).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function hasValidShopifyHmac(rawBody, signature) {
+  if (!shopifyWebhookSecret || typeof signature !== 'string') return false;
+  const expected = createHmac('sha256', shopifyWebhookSecret).update(rawBody).digest('base64');
+  const suppliedBytes = Buffer.from(signature, 'utf8');
+  const expectedBytes = Buffer.from(expected, 'utf8');
+  return suppliedBytes.length === expectedBytes.length && timingSafeEqual(suppliedBytes, expectedBytes);
+}
+
+function cleanPaidOrder(order) {
+  const lineItems = Array.isArray(order.line_items) ? order.line_items.slice(0, 100).map((item) => ({
+    product_id: item.product_id ?? null,
+    variant_id: item.variant_id ?? null,
+    quantity: Number(item.quantity) || 0,
+    price: item.price ?? null,
+  })) : [];
+  return {
+    order_number: order.order_number ?? null,
+    name: typeof order.name === 'string' ? order.name.slice(0, 64) : null,
+    currency: typeof order.currency === 'string' ? order.currency.slice(0, 3).toUpperCase() : null,
+    value: order.current_total_price ?? order.total_price ?? null,
+    line_items: lineItems,
+    click_ids: extractClickIds(order.landing_site),
+  };
+}
+
+function extractClickIds(landingSite) {
+  if (typeof landingSite !== 'string' || landingSite.length > 4096) return {};
+  try {
+    const params = new URL(landingSite, 'https://pets-palace.nl').searchParams;
+    return Object.fromEntries(['gclid', 'gbraid', 'wbraid'].flatMap((key) => {
+      const value = params.get(key);
+      return value ? [[key, value.slice(0, 512)]] : [];
+    }));
+  } catch {
+    return {};
+  }
 }
 
 async function healthcheck() {
@@ -117,6 +170,46 @@ const server = http.createServer(async (request, response) => {
       return sendJson(response, 200, { ok: true }, origin);
     } catch {
       return sendJson(response, 503, { ok: false, service: 'database' }, origin);
+    }
+  }
+
+  if (request.method === 'POST' && url.pathname === '/v1/webhooks/shopify/orders-paid') {
+    try {
+      const rawBody = await readBody(request, 1_048_576);
+      if (!hasValidShopifyHmac(rawBody, request.headers['x-shopify-hmac-sha256'])) {
+        return sendJson(response, 401, { error: 'invalid_webhook_signature' }, origin);
+      }
+      if (request.headers['x-shopify-shop-domain'] !== shopifyShopDomain) {
+        return sendJson(response, 403, { error: 'untrusted_shop' }, origin);
+      }
+      const webhookId = request.headers['x-shopify-webhook-id'];
+      if (!isUuid(webhookId)) return sendJson(response, 422, { error: 'invalid_webhook_id' }, origin);
+      const order = JSON.parse(rawBody.toString('utf8'));
+      if (!order?.id) return sendJson(response, 422, { error: 'invalid_order' }, origin);
+
+      const receipt = await pool.query(
+        `INSERT INTO webhook_receipts (webhook_id, topic)
+         VALUES ($1, 'orders/paid') ON CONFLICT (webhook_id) DO NOTHING RETURNING webhook_id`,
+        [webhookId],
+      );
+      if (receipt.rowCount === 0) return sendJson(response, 202, { accepted: true, duplicate: true }, origin);
+
+      await pool.query(
+        `INSERT INTO tracking_events
+          (event_id, event_type, source, occurred_at, order_id, analytics_consent, marketing_consent, payload)
+         VALUES ($1, 'purchase', 'shopify_webhook', $2, $3, false, false, $4)
+         ON CONFLICT (event_id) DO NOTHING`,
+        [
+          stableUuid(`shopify-order:${order.id}`),
+          new Date(order.processed_at ?? order.created_at ?? Date.now()).toISOString(),
+          String(order.id),
+          cleanPaidOrder(order),
+        ],
+      );
+      return sendJson(response, 202, { accepted: true }, origin);
+    } catch (error) {
+      const knownError = error instanceof Error && ['payload_too_large'].includes(error.message);
+      return sendJson(response, knownError ? 413 : 500, { error: knownError ? error.message : 'internal_error' }, origin);
     }
   }
 

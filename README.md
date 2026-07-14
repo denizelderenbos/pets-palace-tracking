@@ -4,8 +4,8 @@ Open-source, self-hosted server-side conversion tracking for Pet's Palace.
 
 The service receives the consented funnel events `page_view`, `add_to_cart`,
 `begin_checkout` and `purchase`. It records no browser-provided PII. Paid
-orders will be accepted only through a Shopify HMAC-verified webhook in the
-next implementation phase.
+orders are accepted only through the HMAC-verified Shopify `orders/paid`
+webhook at `/v1/webhooks/shopify/orders-paid`.
 
 ## Runtime
 
@@ -22,4 +22,6 @@ docker compose up --build
 ```
 
 `GET /healthz` checks the database connection. `POST /v1/events` accepts only
-browser funnel events from `https://pets-palace.nl`.
+browser funnel events from `https://pets-palace.nl`. The webhook validates the
+Shopify app client secret and deduplicates deliveries before recording a
+purchase.

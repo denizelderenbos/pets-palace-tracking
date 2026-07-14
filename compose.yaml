@@ -8,6 +8,8 @@ services:
       DATABASE_URL: postgresql://tracking:${POSTGRES_PASSWORD:?set in .env}@db:5432/tracking
       PORT: 3000
       TRUSTED_ORIGIN: ${TRUSTED_ORIGIN:-https://pets-palace.nl}
+      SHOPIFY_SHOP_DOMAIN: ${SHOPIFY_SHOP_DOMAIN:-pets-palace-eu.myshopify.com}
+      SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
     depends_on:
       db:
         condition: service_healthy
