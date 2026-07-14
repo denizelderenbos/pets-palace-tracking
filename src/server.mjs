@@ -187,7 +187,7 @@ async function deliverPendingPurchases() {
   if (!rows.rowCount) return;
   try {
     const events = rows.rows.map(({ event_id, occurred_at, order_id, payload }) => ({ transactionId: order_id, eventTimestamp: occurred_at.toISOString(), currency: payload.currency, conversionValue: Number(payload.value), eventSource: 'WEB', adIdentifiers: payload.click_ids, destinationReferences: ['purchase'], additionalEventParameters: [{ parameterName: 'event_id', value: event_id }] }));
-    const response = await fetch('https://datamanager.googleapis.com/v1/events:ingest', { method: 'POST', headers: { Authorization: `Bearer ${await googleAccessToken()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ destinations: [{ destinationReference: 'purchase', operatingAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, loginAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, productDestinationId: googleAdsConversionActionId }], events }) });
+    const response = await fetch('https://datamanager.googleapis.com/v1/events:ingest', { method: 'POST', headers: { Authorization: `Bearer ${await googleAccessToken()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ destinations: [{ reference: 'purchase', operatingAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, loginAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, productDestinationId: googleAdsConversionActionId }], events }) });
     if (!response.ok) throw new Error(`datamanager_${response.status}`);
     await pool.query(`UPDATE delivery_attempts SET status='sent', sent_at=now() WHERE id = ANY($1)`, [rows.rows.map((r) => r.id)]);
   } catch (error) { console.error('Google Data Manager delivery failed', error); }
