@@ -29,6 +29,16 @@ if (!databaseUrl) throw new Error('DATABASE_URL is required');
 const pool = new Pool({ connectionString: databaseUrl, max: 10 });
 const allowedEventTypes = new Set(['page_view', 'add_to_cart', 'begin_checkout', 'purchase']);
 
+function isTrustedBrowserOrigin(origin) {
+  if (origin === trustedOrigin) return true;
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'https:' && (url.hostname.endsWith('.myshopify.com') || url.hostname.endsWith('.shopifycdn.com'));
+  } catch {
+    return false;
+  }
+}
+
 async function bootstrapSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracking_events (
@@ -71,7 +81,7 @@ function sendJson(response, status, body, origin) {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
   };
-  if (origin === trustedOrigin) headers['Access-Control-Allow-Origin'] = trustedOrigin;
+  if (isTrustedBrowserOrigin(origin)) headers['Access-Control-Allow-Origin'] = origin;
   response.writeHead(status, headers);
   response.end(JSON.stringify(body));
 }
@@ -197,9 +207,9 @@ const server = http.createServer(async (request, response) => {
   const origin = request.headers.origin;
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
 
-  if (request.method === 'OPTIONS' && url.pathname === '/v1/events' && origin === trustedOrigin) {
+  if (request.method === 'OPTIONS' && url.pathname === '/v1/events' && isTrustedBrowserOrigin(origin)) {
     response.writeHead(204, {
-      'Access-Control-Allow-Origin': trustedOrigin,
+      'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
       'Access-Control-Max-Age': '86400',
@@ -273,7 +283,7 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && url.pathname === '/v1/events') {
-    if (origin !== trustedOrigin) return sendJson(response, 403, { error: 'untrusted_origin' }, origin);
+    if (!isTrustedBrowserOrigin(origin)) return sendJson(response, 403, { error: 'untrusted_origin' }, origin);
     try {
       const event = await readJson(request);
       const eventType = event.event_type;
