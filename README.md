@@ -25,3 +25,10 @@ docker compose up --build
 browser funnel events from `https://pets-palace.nl`. The webhook validates the
 Shopify app client secret and deduplicates deliveries before recording a
 purchase.
+
+For keyless Google Cloud access, the service can publish an OpenID Connect
+discovery document and JWKS at `/.well-known/openid-configuration` and
+`/.well-known/jwks.json`. Configure an RSA signing key only as the Coolify
+`WORKLOAD_IDENTITY_PRIVATE_KEY` secret, never in Git. Google Workload Identity
+Federation trusts the corresponding public key and exchanges short-lived JWTs
+for short-lived Google access tokens.

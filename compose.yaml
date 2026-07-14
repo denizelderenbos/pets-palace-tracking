@@ -10,6 +10,9 @@ services:
       TRUSTED_ORIGIN: ${TRUSTED_ORIGIN:-https://pets-palace.nl}
       SHOPIFY_SHOP_DOMAIN: ${SHOPIFY_SHOP_DOMAIN:-pets-palace-eu.myshopify.com}
       SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
+      WORKLOAD_IDENTITY_ISSUER: ${WORKLOAD_IDENTITY_ISSUER:-https://track.pets-palace.nl}
+      WORKLOAD_IDENTITY_KEY_ID: ${WORKLOAD_IDENTITY_KEY_ID:-pets-palace-tracking-v1}
+      WORKLOAD_IDENTITY_PRIVATE_KEY: ${WORKLOAD_IDENTITY_PRIVATE_KEY:-}
     depends_on:
       db:
         condition: service_healthy

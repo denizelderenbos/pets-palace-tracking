@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, createPrivateKey, createPublicKey, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Pool } from 'pg';
 
 const port = Number(process.env.PORT ?? 3000);
@@ -7,6 +7,17 @@ const trustedOrigin = process.env.TRUSTED_ORIGIN ?? 'https://pets-palace.nl';
 const databaseUrl = process.env.DATABASE_URL;
 const shopifyWebhookSecret = process.env.SHOPIFY_WEBHOOK_SECRET;
 const shopifyShopDomain = process.env.SHOPIFY_SHOP_DOMAIN ?? 'pets-palace-eu.myshopify.com';
+const workloadIdentityIssuer = process.env.WORKLOAD_IDENTITY_ISSUER ?? 'https://track.pets-palace.nl';
+const workloadIdentityKeyId = process.env.WORKLOAD_IDENTITY_KEY_ID ?? 'pets-palace-tracking-v1';
+const workloadIdentityPrivateKey = process.env.WORKLOAD_IDENTITY_PRIVATE_KEY;
+const workloadIdentityPublicJwk = workloadIdentityPrivateKey
+  ? {
+      ...createPublicKey(createPrivateKey(workloadIdentityPrivateKey.replace(/\\n/g, '\n'))).export({ format: 'jwk' }),
+      alg: 'RS256',
+      kid: workloadIdentityKeyId,
+      use: 'sig',
+    }
+  : null;
 
 if (!databaseUrl) throw new Error('DATABASE_URL is required');
 
@@ -171,6 +182,21 @@ const server = http.createServer(async (request, response) => {
     } catch {
       return sendJson(response, 503, { ok: false, service: 'database' }, origin);
     }
+  }
+
+  if (request.method === 'GET' && url.pathname === '/.well-known/openid-configuration') {
+    if (!workloadIdentityPublicJwk) return sendJson(response, 503, { error: 'workload_identity_not_configured' }, origin);
+    return sendJson(response, 200, {
+      issuer: workloadIdentityIssuer,
+      jwks_uri: `${workloadIdentityIssuer}/.well-known/jwks.json`,
+      subject_types_supported: ['public'],
+      id_token_signing_alg_values_supported: ['RS256'],
+    }, origin);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/.well-known/jwks.json') {
+    if (!workloadIdentityPublicJwk) return sendJson(response, 503, { error: 'workload_identity_not_configured' }, origin);
+    return sendJson(response, 200, { keys: [workloadIdentityPublicJwk] }, origin);
   }
 
   if (request.method === 'POST' && url.pathname === '/v1/webhooks/shopify/orders-paid') {
