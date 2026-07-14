@@ -291,7 +291,9 @@ const server = http.createServer(async (request, response) => {
       if (!allowedEventTypes.has(eventType) || eventType === 'purchase') {
         return sendJson(response, 422, { error: 'invalid_event_type' }, origin);
       }
-      if (!isUuid(event.event_id)) return sendJson(response, 422, { error: 'invalid_event_id' }, origin);
+      if (typeof event.event_id !== 'string' || event.event_id.length < 1 || event.event_id.length > 512) {
+        return sendJson(response, 422, { error: 'invalid_event_id' }, origin);
+      }
       if (event.attribution_id && !isUuid(event.attribution_id)) return sendJson(response, 422, { error: 'invalid_attribution_id' }, origin);
 
       const occurredAt = new Date(event.occurred_at ?? Date.now());
@@ -303,7 +305,7 @@ const server = http.createServer(async (request, response) => {
          VALUES ($1, $2, 'browser', $3, $4, $5, $6, $7, $8)
          ON CONFLICT (event_id) DO NOTHING`,
         [
-          event.event_id,
+          isUuid(event.event_id) ? event.event_id : stableUuid(`shopify-browser:${event.event_id}`),
           eventType,
           occurredAt.toISOString(),
           typeof event.order_id === 'string' ? event.order_id.slice(0, 128) : null,
