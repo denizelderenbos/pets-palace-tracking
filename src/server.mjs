@@ -21,7 +21,12 @@ const workloadIdentityPublicJwk = workloadIdentityPrivateKey
 const googleWifAudience = process.env.GOOGLE_WIF_AUDIENCE;
 const googleServiceAccount = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const googleAdsCustomerId = process.env.GOOGLE_ADS_CUSTOMER_ID;
-const googleAdsConversionActionId = process.env.GOOGLE_ADS_CONVERSION_ACTION_ID;
+const googleAdsConversionActionIds = {
+  purchase: process.env.GOOGLE_ADS_CONVERSION_ACTION_ID,
+  add_to_cart: process.env.GOOGLE_ADS_CONVERSION_ACTION_ID_ADD_TO_CART,
+  begin_checkout: process.env.GOOGLE_ADS_CONVERSION_ACTION_ID_BEGIN_CHECKOUT,
+  page_view: process.env.GOOGLE_ADS_CONVERSION_ACTION_ID_PAGE_VIEW,
+};
 const googleDataManagerEnabled = process.env.GOOGLE_DATA_MANAGER_ENABLED === 'true';
 
 if (!databaseUrl) throw new Error('DATABASE_URL is required');
@@ -181,6 +186,20 @@ function extractClickIds(order) {
   return ids;
 }
 
+// Click IDs the pixel captured from the landing URL (or first-party storage).
+// Same validation as for webhook orders: known keys, plausible length/charset.
+function browserClickIds(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const ids = {};
+  for (const key of ['gclid', 'gbraid', 'wbraid']) {
+    const candidate = value[key];
+    if (typeof candidate === 'string' && candidate.length >= MINIMUM_CLICK_ID_LENGTH && candidate.length <= 512 && /^[A-Za-z0-9_-]+$/.test(candidate)) {
+      ids[key] = candidate;
+    }
+  }
+  return ids;
+}
+
 function landingSiteClickIds(landingSite) {
   if (typeof landingSite !== 'string' || landingSite.length > 4096) return {};
   try {
@@ -218,46 +237,63 @@ async function googleAccessToken() {
   return token.accessToken;
 }
 
-async function deliverPendingPurchases() {
-  if (!googleDataManagerEnabled || !googleAdsCustomerId || !googleAdsConversionActionId) return;
-  await submitPendingPurchases();
-  await pollSubmittedPurchases();
+function isDeliverable({ event_type, payload }) {
+  if (!googleAdsConversionActionIds[event_type]) return false;
+  if (!payload.click_ids || Object.keys(payload.click_ids).length === 0) return false;
+  if (event_type === 'purchase') return Boolean(payload.currency) && Number(payload.value) > 0;
+  return true;
 }
 
-async function submitPendingPurchases() {
+async function deliverPendingEvents() {
+  if (!googleDataManagerEnabled || !googleAdsCustomerId || !googleAdsConversionActionIds.purchase) return;
+  await submitPendingEvents();
+  await pollSubmittedEvents();
+}
+
+async function submitPendingEvents() {
   // Request statuses are only retrievable for a limited time; resubmit stale
   // submissions (Google deduplicates on transactionId, so this is safe).
   await pool.query(`UPDATE delivery_attempts SET request_id=NULL WHERE destination='google_data_manager' AND status='pending' AND request_id IS NOT NULL AND submitted_at < now() - interval '24 hours'`);
-  const rows = await pool.query(`SELECT d.id, e.event_id, e.occurred_at, e.order_id, e.payload FROM delivery_attempts d JOIN tracking_events e ON e.event_id=d.event_id WHERE d.destination='google_data_manager' AND d.status='pending' AND d.request_id IS NULL ORDER BY d.id LIMIT 50`);
+  const rows = await pool.query(`SELECT d.id, e.event_id, e.event_type, e.occurred_at, e.order_id, e.payload FROM delivery_attempts d JOIN tracking_events e ON e.event_id=d.event_id WHERE d.destination='google_data_manager' AND d.status='pending' AND d.request_id IS NULL ORDER BY d.id LIMIT 200`);
   if (!rows.rowCount) return;
-  const deliverable = rows.rows.filter(({ payload }) => payload.click_ids && Object.keys(payload.click_ids).length > 0 && payload.currency && Number(payload.value) > 0);
+  const deliverable = rows.rows.filter(isDeliverable);
   const undeliverable = rows.rows.filter((row) => !deliverable.includes(row));
   if (undeliverable.length) {
-    console.log('Skipping purchases without usable ad identifiers', undeliverable.map((r) => r.order_id).join(', '));
+    console.log('Skipping events without usable ad identifiers', undeliverable.map((r) => r.order_id ?? r.event_id).join(', '));
     await pool.query(`UPDATE delivery_attempts SET status='failed', error_code='no_ad_identifiers' WHERE id = ANY($1)`, [undeliverable.map((r) => r.id)]);
   }
   if (!deliverable.length) return;
   try {
-    const events = deliverable.map(({ event_id, occurred_at, order_id, payload }) => ({ transactionId: order_id, eventTimestamp: occurred_at.toISOString(), currency: payload.currency, conversionValue: Number(payload.value), eventSource: 'WEB', adIdentifiers: payload.click_ids, destinationReferences: ['purchase'], additionalEventParameters: [{ parameterName: 'event_id', value: event_id }] }));
+    const eventTypes = [...new Set(deliverable.map((r) => r.event_type))];
+    const destinations = eventTypes.map((eventType) => ({ reference: eventType, operatingAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, loginAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, productDestinationId: googleAdsConversionActionIds[eventType] }));
+    const events = deliverable.map(({ event_id, event_type, occurred_at, order_id, payload }) => ({
+      transactionId: order_id ?? event_id,
+      eventTimestamp: occurred_at.toISOString(),
+      ...(payload.currency && Number(payload.value) > 0 ? { currency: payload.currency, conversionValue: Number(payload.value) } : {}),
+      eventSource: 'WEB',
+      adIdentifiers: payload.click_ids,
+      destinationReferences: [event_type],
+      additionalEventParameters: [{ parameterName: 'event_id', value: event_id }],
+    }));
     const response = await fetch('https://datamanager.googleapis.com/v1/events:ingest', {
       method: 'POST',
       headers: { Authorization: `Bearer ${await googleAccessToken()}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        destinations: [{ reference: 'purchase', operatingAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, loginAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, productDestinationId: googleAdsConversionActionId }],
-        // Click IDs are only captured by the consented marketing pixel, so a
-        // purchase with ad identifiers implies granted marketing consent.
+        destinations,
+        // Click IDs are only captured by the consented marketing pixel, so an
+        // event with ad identifiers implies granted marketing consent.
         consent: { adUserData: 'CONSENT_GRANTED', adPersonalization: 'CONSENT_GRANTED' },
         events,
       }),
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(`datamanager_${response.status} ${JSON.stringify(body)}`);
-    console.log(`Data Manager ingest accepted request ${body.requestId} with ${events.length} purchase(s):`, deliverable.map((r) => r.order_id).join(', '));
+    console.log(`Data Manager ingest accepted request ${body.requestId} with ${events.length} event(s):`, deliverable.map((r) => `${r.event_type}:${r.order_id ?? r.event_id}`).join(', '));
     await pool.query(`UPDATE delivery_attempts SET request_id=$2, submitted_at=now() WHERE id = ANY($1)`, [deliverable.map((r) => r.id), body.requestId ?? null]);
   } catch (error) { console.error('Google Data Manager delivery failed', error); }
 }
 
-async function pollSubmittedPurchases() {
+async function pollSubmittedEvents() {
   const rows = await pool.query(`SELECT request_id, array_agg(order_id) AS order_ids FROM delivery_attempts d JOIN tracking_events e ON e.event_id=d.event_id WHERE d.destination='google_data_manager' AND d.status='pending' AND d.request_id IS NOT NULL GROUP BY request_id`);
   for (const { request_id, order_ids } of rows.rows) {
     try {
@@ -388,22 +424,30 @@ const server = http.createServer(async (request, response) => {
       const occurredAt = new Date(event.occurred_at ?? Date.now());
       if (Number.isNaN(occurredAt.getTime())) return sendJson(response, 422, { error: 'invalid_occurred_at' }, origin);
 
-      await pool.query(
+      const eventId = isUuid(event.event_id) ? event.event_id : stableUuid(`shopify-browser:${event.event_id}`);
+      const marketingConsent = event.consent?.marketing === true;
+      const clickIds = browserClickIds(event.click_ids);
+      const payload = cleanPayload(eventType, event.data);
+      if (Object.keys(clickIds).length) payload.click_ids = clickIds;
+      const inserted = await pool.query(
         `INSERT INTO tracking_events
           (event_id, event_type, source, occurred_at, order_id, attribution_id, analytics_consent, marketing_consent, payload)
          VALUES ($1, $2, 'browser', $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (event_id) DO NOTHING`,
+         ON CONFLICT (event_id) DO NOTHING RETURNING event_id`,
         [
-          isUuid(event.event_id) ? event.event_id : stableUuid(`shopify-browser:${event.event_id}`),
+          eventId,
           eventType,
           occurredAt.toISOString(),
           typeof event.order_id === 'string' ? event.order_id.slice(0, 128) : null,
           event.attribution_id ?? null,
           event.consent?.analytics === true,
-          event.consent?.marketing === true,
-          cleanPayload(eventType, event.data),
+          marketingConsent,
+          payload,
         ],
       );
+      if (inserted.rowCount > 0 && marketingConsent && Object.keys(clickIds).length > 0 && googleAdsConversionActionIds[eventType]) {
+        await pool.query(`INSERT INTO delivery_attempts (event_id, destination, status) VALUES ($1, 'google_data_manager', 'pending') ON CONFLICT DO NOTHING`, [eventId]);
+      }
       return sendJson(response, 202, { accepted: true, event_id: event.event_id }, origin);
     } catch (error) {
       const knownError = error instanceof Error && ['payload_too_large', 'invalid_json'].includes(error.message);
@@ -418,7 +462,7 @@ bootstrapSchema()
   .then(() => {
     server.listen(port, '0.0.0.0', () => {
       console.log(`pets-palace-tracking listening on ${port}`);
-      setInterval(() => deliverPendingPurchases().catch((error) => console.error(error)), 30_000).unref();
+      setInterval(() => deliverPendingEvents().catch((error) => console.error(error)), 30_000).unref();
     });
   })
   .catch((error) => {
