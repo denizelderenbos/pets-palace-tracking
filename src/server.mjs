@@ -74,6 +74,8 @@ async function bootstrapSchema() {
       error_code TEXT,
       UNIQUE (event_id, destination)
     );
+    ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS request_id TEXT;
+    ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ;
   `);
 }
 
@@ -156,11 +158,30 @@ function cleanPaidOrder(order) {
     currency: typeof order.currency === 'string' ? order.currency.slice(0, 3).toUpperCase() : null,
     value: order.current_total_price ?? order.total_price ?? null,
     line_items: lineItems,
-    click_ids: extractClickIds(order.landing_site),
+    click_ids: extractClickIds(order),
   };
 }
 
-function extractClickIds(landingSite) {
+// Shopify truncates landing_site to ~255 characters, which mangles click IDs
+// (a gclid can arrive as "gclid=C"). The full IDs are also stored as order
+// note attributes by the browser-side pixel, so prefer those.
+const MINIMUM_CLICK_ID_LENGTH = 20;
+
+function extractClickIds(order) {
+  const fromLandingSite = landingSiteClickIds(order.landing_site);
+  const noteAttributes = Array.isArray(order.note_attributes) ? order.note_attributes : [];
+  const ids = {};
+  for (const key of ['gclid', 'gbraid', 'wbraid']) {
+    const note = noteAttributes.find((attribute) => attribute?.name === key && typeof attribute.value === 'string');
+    const candidate = [note?.value, fromLandingSite[key]].find(
+      (value) => typeof value === 'string' && value.length >= MINIMUM_CLICK_ID_LENGTH,
+    );
+    if (candidate) ids[key] = candidate.slice(0, 512);
+  }
+  return ids;
+}
+
+function landingSiteClickIds(landingSite) {
   if (typeof landingSite !== 'string' || landingSite.length > 4096) return {};
   try {
     const params = new URL(landingSite, 'https://pets-palace.nl').searchParams;
@@ -179,8 +200,11 @@ async function healthcheck() {
 
 function b64url(value) { return Buffer.from(value).toString('base64url'); }
 
+let cachedGoogleToken = null;
+
 async function googleAccessToken() {
   if (!workloadIdentityPrivateKey || !googleWifAudience || !googleServiceAccount) throw new Error('google_auth_not_configured');
+  if (cachedGoogleToken && cachedGoogleToken.expiresAt > Date.now() + 60_000) return cachedGoogleToken.token;
   const now = Math.floor(Date.now() / 1000);
   const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: workloadIdentityKeyId }));
   const claims = b64url(JSON.stringify({ iss: workloadIdentityIssuer, sub: 'tracking-service', aud: workloadIdentityIssuer, iat: now, exp: now + 600 }));
@@ -189,19 +213,68 @@ async function googleAccessToken() {
   const sts = await fetch('https://sts.googleapis.com/v1/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange', requested_token_type: 'urn:ietf:params:oauth:token-type:access_token', subject_token_type: 'urn:ietf:params:oauth:token-type:jwt', audience: googleWifAudience, scope: 'https://www.googleapis.com/auth/cloud-platform', subject_token: assertion }) });
   const federated = await sts.json(); if (!sts.ok) throw new Error(`sts_${sts.status}`);
   const iam = await fetch(`https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(googleServiceAccount)}:generateAccessToken`, { method: 'POST', headers: { Authorization: `Bearer ${federated.access_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ scope: ['https://www.googleapis.com/auth/datamanager'], lifetime: '900s' }) });
-  const token = await iam.json(); if (!iam.ok) throw new Error(`iam_${iam.status}`); return token.accessToken;
+  const token = await iam.json(); if (!iam.ok) throw new Error(`iam_${iam.status}`);
+  cachedGoogleToken = { token: token.accessToken, expiresAt: Date.now() + 840_000 };
+  return token.accessToken;
 }
 
 async function deliverPendingPurchases() {
   if (!googleDataManagerEnabled || !googleAdsCustomerId || !googleAdsConversionActionId) return;
-  const rows = await pool.query(`SELECT d.id, e.event_id, e.occurred_at, e.order_id, e.payload FROM delivery_attempts d JOIN tracking_events e ON e.event_id=d.event_id WHERE d.destination='google_data_manager' AND d.status='pending' ORDER BY d.id LIMIT 50`);
+  await submitPendingPurchases();
+  await pollSubmittedPurchases();
+}
+
+async function submitPendingPurchases() {
+  // Request statuses are only retrievable for a limited time; resubmit stale
+  // submissions (Google deduplicates on transactionId, so this is safe).
+  await pool.query(`UPDATE delivery_attempts SET request_id=NULL WHERE destination='google_data_manager' AND status='pending' AND request_id IS NOT NULL AND submitted_at < now() - interval '24 hours'`);
+  const rows = await pool.query(`SELECT d.id, e.event_id, e.occurred_at, e.order_id, e.payload FROM delivery_attempts d JOIN tracking_events e ON e.event_id=d.event_id WHERE d.destination='google_data_manager' AND d.status='pending' AND d.request_id IS NULL ORDER BY d.id LIMIT 50`);
   if (!rows.rowCount) return;
+  const deliverable = rows.rows.filter(({ payload }) => payload.click_ids && Object.keys(payload.click_ids).length > 0 && payload.currency && Number(payload.value) > 0);
+  const undeliverable = rows.rows.filter((row) => !deliverable.includes(row));
+  if (undeliverable.length) {
+    console.log('Skipping purchases without usable ad identifiers', undeliverable.map((r) => r.order_id).join(', '));
+    await pool.query(`UPDATE delivery_attempts SET status='failed', error_code='no_ad_identifiers' WHERE id = ANY($1)`, [undeliverable.map((r) => r.id)]);
+  }
+  if (!deliverable.length) return;
   try {
-    const events = rows.rows.map(({ event_id, occurred_at, order_id, payload }) => ({ transactionId: order_id, eventTimestamp: occurred_at.toISOString(), currency: payload.currency, conversionValue: Number(payload.value), eventSource: 'WEB', adIdentifiers: payload.click_ids, destinationReferences: ['purchase'], additionalEventParameters: [{ parameterName: 'event_id', value: event_id }] }));
-    const response = await fetch('https://datamanager.googleapis.com/v1/events:ingest', { method: 'POST', headers: { Authorization: `Bearer ${await googleAccessToken()}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ destinations: [{ reference: 'purchase', operatingAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, loginAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, productDestinationId: googleAdsConversionActionId }], events }) });
-    if (!response.ok) throw new Error(`datamanager_${response.status}`);
-    await pool.query(`UPDATE delivery_attempts SET status='sent', sent_at=now() WHERE id = ANY($1)`, [rows.rows.map((r) => r.id)]);
+    const events = deliverable.map(({ event_id, occurred_at, order_id, payload }) => ({ transactionId: order_id, eventTimestamp: occurred_at.toISOString(), currency: payload.currency, conversionValue: Number(payload.value), eventSource: 'WEB', adIdentifiers: payload.click_ids, destinationReferences: ['purchase'], additionalEventParameters: [{ parameterName: 'event_id', value: event_id }] }));
+    const response = await fetch('https://datamanager.googleapis.com/v1/events:ingest', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${await googleAccessToken()}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        destinations: [{ reference: 'purchase', operatingAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, loginAccount: { accountType: 'GOOGLE_ADS', accountId: googleAdsCustomerId }, productDestinationId: googleAdsConversionActionId }],
+        // Click IDs are only captured by the consented marketing pixel, so a
+        // purchase with ad identifiers implies granted marketing consent.
+        consent: { adUserData: 'CONSENT_GRANTED', adPersonalization: 'CONSENT_GRANTED' },
+        events,
+      }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(`datamanager_${response.status} ${JSON.stringify(body)}`);
+    console.log(`Data Manager ingest accepted request ${body.requestId} with ${events.length} purchase(s):`, deliverable.map((r) => r.order_id).join(', '));
+    await pool.query(`UPDATE delivery_attempts SET request_id=$2, submitted_at=now() WHERE id = ANY($1)`, [deliverable.map((r) => r.id), body.requestId ?? null]);
   } catch (error) { console.error('Google Data Manager delivery failed', error); }
+}
+
+async function pollSubmittedPurchases() {
+  const rows = await pool.query(`SELECT request_id, array_agg(order_id) AS order_ids FROM delivery_attempts d JOIN tracking_events e ON e.event_id=d.event_id WHERE d.destination='google_data_manager' AND d.status='pending' AND d.request_id IS NOT NULL GROUP BY request_id`);
+  for (const { request_id, order_ids } of rows.rows) {
+    try {
+      const response = await fetch(`https://datamanager.googleapis.com/v1/requestStatus:retrieve?requestId=${encodeURIComponent(request_id)}`, { headers: { Authorization: `Bearer ${await googleAccessToken()}` } });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) { console.error(`Data Manager status retrieval failed for ${request_id}`, response.status, JSON.stringify(body)); continue; }
+      const destinationStatus = body.requestStatusPerDestination?.[0];
+      const status = destinationStatus?.requestStatus;
+      if (!status || status === 'PROCESSING') continue;
+      console.log(`Data Manager request ${request_id} finished as ${status} for order(s) ${order_ids.join(', ')}:`, JSON.stringify(destinationStatus));
+      if (status === 'SUCCESS' || status === 'PARTIAL_SUCCESS') {
+        await pool.query(`UPDATE delivery_attempts SET status='sent', sent_at=now() WHERE request_id=$1 AND status='pending'`, [request_id]);
+      } else {
+        await pool.query(`UPDATE delivery_attempts SET status='failed', error_code=$2 WHERE request_id=$1 AND status='pending'`, [request_id, status.slice(0, 64)]);
+      }
+    } catch (error) { console.error(`Data Manager status poll failed for ${request_id}`, error); }
+  }
 }
 
 const server = http.createServer(async (request, response) => {
@@ -243,42 +316,58 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && url.pathname === '/v1/webhooks/shopify/orders-paid') {
+    const webhookId = request.headers['x-shopify-webhook-id'];
     try {
       const rawBody = await readBody(request, 1_048_576);
       if (!hasValidShopifyHmac(rawBody, request.headers['x-shopify-hmac-sha256'])) {
+        console.error(`orders/paid webhook ${webhookId ?? '(no id)'} rejected: invalid signature`);
         return sendJson(response, 401, { error: 'invalid_webhook_signature' }, origin);
       }
       if (request.headers['x-shopify-shop-domain'] !== shopifyShopDomain) {
+        console.error(`orders/paid webhook ${webhookId ?? '(no id)'} rejected: untrusted shop ${request.headers['x-shopify-shop-domain']}`);
         return sendJson(response, 403, { error: 'untrusted_shop' }, origin);
       }
-      const webhookId = request.headers['x-shopify-webhook-id'];
-      if (!isUuid(webhookId)) return sendJson(response, 422, { error: 'invalid_webhook_id' }, origin);
+      if (!isUuid(webhookId)) {
+        console.error('orders/paid webhook rejected: invalid webhook id');
+        return sendJson(response, 422, { error: 'invalid_webhook_id' }, origin);
+      }
       const order = JSON.parse(rawBody.toString('utf8'));
-      if (!order?.id) return sendJson(response, 422, { error: 'invalid_order' }, origin);
+      if (!order?.id) {
+        console.error(`orders/paid webhook ${webhookId} rejected: no order id in payload`);
+        return sendJson(response, 422, { error: 'invalid_order' }, origin);
+      }
 
       const receipt = await pool.query(
         `INSERT INTO webhook_receipts (webhook_id, topic)
          VALUES ($1, 'orders/paid') ON CONFLICT (webhook_id) DO NOTHING RETURNING webhook_id`,
         [webhookId],
       );
-      if (receipt.rowCount === 0) return sendJson(response, 202, { accepted: true, duplicate: true }, origin);
+      if (receipt.rowCount === 0) {
+        console.log(`orders/paid webhook ${webhookId} ignored: duplicate delivery for order ${order.id}`);
+        return sendJson(response, 202, { accepted: true, duplicate: true }, origin);
+      }
 
+      const payload = cleanPaidOrder(order);
+      const hasClickIds = Object.keys(payload.click_ids).length > 0;
+      console.log(`orders/paid webhook ${webhookId} accepted: order ${order.id} (${payload.name ?? '?'}), click IDs: ${hasClickIds ? Object.keys(payload.click_ids).join('+') : 'none'}`);
       await pool.query(
         `INSERT INTO tracking_events
           (event_id, event_type, source, occurred_at, order_id, analytics_consent, marketing_consent, payload)
-         VALUES ($1, 'purchase', 'shopify_webhook', $2, $3, false, false, $4)
+         VALUES ($1, 'purchase', 'shopify_webhook', $2, $3, false, $4, $5)
          ON CONFLICT (event_id) DO NOTHING`,
         [
           stableUuid(`shopify-order:${order.id}`),
           new Date(order.processed_at ?? order.created_at ?? Date.now()).toISOString(),
           String(order.id),
-          cleanPaidOrder(order),
+          hasClickIds,
+          payload,
         ],
       );
       await pool.query(`INSERT INTO delivery_attempts (event_id, destination, status) VALUES ($1, 'google_data_manager', 'pending') ON CONFLICT DO NOTHING`, [stableUuid(`shopify-order:${order.id}`)]);
       return sendJson(response, 202, { accepted: true }, origin);
     } catch (error) {
       const knownError = error instanceof Error && ['payload_too_large'].includes(error.message);
+      console.error(`orders/paid webhook ${webhookId ?? '(no id)'} failed:`, error);
       return sendJson(response, knownError ? 413 : 500, { error: knownError ? error.message : 'internal_error' }, origin);
     }
   }
